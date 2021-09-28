@@ -1,0 +1,40 @@
+docker run --rm \
+  -p 7880:7880 \
+  -p 7881:7881 \
+  -p 7882:7882/udp \
+  -e LIVEKIT_KEYS="APIEm56Vpmajap5: mePihEPd1GwSiRPoMOelKrfDGIzY0bnPjSnlnYFUfeOH" \
+  livekit/livekit-server \
+  --dev \
+  --node-ip=192.168.1.10
+
+
+docker run --rm -e LIVEKIT_KEYS="APIEm56Vpmajap5: qcTeqexP2MB24q9YaJXRYdytCJsEqT21Phut656DUp9" \
+  livekit/livekit-server create-join-token --room myroom \
+  --identity nhuan
+
+
+docker run --rm livekit/livekit-server generate-keys
+API Key:  APITjSzkf44X7Ny
+Secret Key:  hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA
+
+#Start the server#
+LIVEKIT_KEYS="APITjSzkf44X7Ny: hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA" ./bin/livekit-server --dev
+
+#Generate access token #Nhuan
+LIVEKIT_KEYS="APITjSzkf44X7Ny: hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA" ./bin/livekit-server create-join-token \
+--room myroom \
+--identity Nhuan
+
+LIVEKIT_KEYS="APITjSzkf44X7Ny: hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA" ./bin/livekit-server create-join-token \
+--room 222 \
+--identity Luong
+
+LIVEKIT_KEYS="APITjSzkf44X7Ny: hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA" ./bin/livekit-server create-join-token \
+--room 222 \
+--identity Thanh
+
+LIVEKIT_KEYS="APITjSzkf44X7Ny: hyzN1GNHy9tQcpBwtbGJgxKspNjF4YGZSoyvbpC6WcA" ./bin/livekit-server create-join-token \
+--room 222 \
+--identity Hang
+
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE2MzUwMzMwMTksImlzcyI6IkFQSVRqU3prZjQ0WDdOeSIsImp0aSI6Ik5odWFuIiwibmJmIjoxNjMyNDQxMDE5LCJzdWIiOiJOaHVhbiIsInZpZGVvIjp7InJvb20iOiIyMjIiLCJyb29tSm9pbiI6dHJ1ZX19.n_1fEwh72nm0N3hR1enR1dj5GDfc5Bb5mWLaoRLqC0U
