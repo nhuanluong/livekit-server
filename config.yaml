@@ -5,8 +5,8 @@ port: 7880
 # log level, valid values: debug, info, warning, error
 log_level: debug
 
-cert_file: certs/cert.pem
-key_file: certs/private.pem
+#cert_file: certs/cert.pem
+#key_file: certs/private.pem
 
 # when redis is set, LiveKit will automatically operate in a fully distributed fashion
 # clients could connect to any node and be routed to the same room
