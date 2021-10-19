@@ -5,7 +5,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/livekit/livekit-server/pkg/routing/selector"
 	"github.com/mitchellh/go-homedir"
 	"github.com/pion/webrtc/v3"
 	"github.com/pkg/errors"
@@ -111,9 +110,17 @@ type WebHookConfig struct {
 }
 
 type NodeSelectorConfig struct {
-	Kind         string                  `yaml:"kind"`
-	SysloadLimit float32                 `yaml:"sysload_limit"`
-	Regions      []selector.RegionConfig `yaml:"regions"`
+	Kind         string         `yaml:"kind"`
+	SysloadLimit float32        `yaml:"sysload_limit"`
+	Regions      []RegionConfig `yaml:"regions"`
+}
+
+// RegionConfig lists available regions and their latitude/longitude, so the selector would prefer
+// regions that are closer
+type RegionConfig struct {
+	Name string  `yaml:"name"`
+	Lat  float64 `yaml:"lat"`
+	Lon  float64 `yaml:"lon"`
 }
 
 func NewConfig(confString string, c *cli.Context) (*Config, error) {
@@ -197,6 +204,7 @@ func NewConfig(confString string, c *cli.Context) (*Config, error) {
 			return nil, err
 		}
 	}
+
 	return conf, nil
 }
 
@@ -252,8 +260,4 @@ func (conf *Config) unmarshalKeys(keys string) error {
 		}
 	}
 	return nil
-}
-
-func GetAudioConfig(conf *Config) AudioConfig {
-	return conf.Audio
 }
