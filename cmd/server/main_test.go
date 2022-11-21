@@ -23,12 +23,14 @@ func TestGetConfigString(t *testing.T) {
 		{"file", "", nil, "fileContent"},
 	}
 	for _, test := range tests {
-		writeConfigFile(test, t)
-		defer os.Remove(test.configFileName)
+		func() {
+			writeConfigFile(test, t)
+			defer os.Remove(test.configFileName)
 
-		configBody, err := getConfigString(test.configFileName, test.configBody)
-		require.Equal(t, test.expectedError, err)
-		require.Equal(t, test.expectedConfigBody, configBody)
+			configBody, err := getConfigString(test.configFileName, test.configBody)
+			require.Equal(t, test.expectedError, err)
+			require.Equal(t, test.expectedConfigBody, configBody)
+		}()
 	}
 }
 
@@ -41,7 +43,7 @@ func TestShouldReturnErrorIfConfigFileDoesNotExist(t *testing.T) {
 func writeConfigFile(test testStruct, t *testing.T) {
 	if test.configFileName != "" {
 		d1 := []byte(test.expectedConfigBody)
-		err := os.WriteFile(test.configFileName, d1, 0644)
+		err := os.WriteFile(test.configFileName, d1, 0o644)
 		require.NoError(t, err)
 	}
 }

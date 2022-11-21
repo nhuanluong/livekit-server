@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/pion/webrtc/v3"
@@ -52,8 +53,8 @@ func (w *TrackWriter) Start() error {
 		return err
 	}
 
-	logger.Infow("starting track writer",
-		"track", w.track.ID(),
+	logger.Debugw("starting track writer",
+		"trackID", w.track.ID(),
 		"mime", w.mime)
 	switch w.mime {
 	case webrtc.MimeTypeOpus:
@@ -85,12 +86,17 @@ func (w *TrackWriter) Stop() {
 func (w *TrackWriter) writeNull() {
 	defer w.onWriteComplete()
 	sample := media.Sample{Data: []byte{0x0, 0xff, 0xff, 0xff, 0xff}, Duration: 30 * time.Millisecond}
+	h264Sample := media.Sample{Data: []byte{0x00, 0x00, 0x00, 0x01, 0x7, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x8, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x5, 0xff, 0xff, 0xff, 0xff}, Duration: 30 * time.Millisecond}
 	for {
 		select {
 		case <-time.After(20 * time.Millisecond):
-			w.track.WriteSample(sample)
+			if strings.EqualFold(w.mime, webrtc.MimeTypeH264) {
+				w.track.WriteSample(h264Sample)
+			} else {
+				w.track.WriteSample(sample)
+			}
 		case <-w.ctx.Done():
-			break
+			return
 		}
 	}
 }
@@ -104,7 +110,7 @@ func (w *TrackWriter) writeOgg() {
 		}
 		pageData, pageHeader, err := w.ogg.ParseNextPage()
 		if err == io.EOF {
-			logger.Infow("all audio samples parsed and sent")
+			logger.Debugw("all audio samples parsed and sent")
 			w.onWriteComplete()
 			return
 		}
@@ -129,7 +135,7 @@ func (w *TrackWriter) writeOgg() {
 }
 
 func (w *TrackWriter) writeVP8() {
-	// Send our video file frame at a time. Pace our sending so we send it at the same speed it should be played back as.
+	// Send our video file frame at a time. Pace our sending such that we send it at the same speed it should be played back as.
 	// This isn't required since the video is timestamped, but we will such much higher loss if we send all at once.
 	sleepTime := time.Millisecond * time.Duration((float32(w.ivfheader.TimebaseNumerator)/float32(w.ivfheader.TimebaseDenominator))*1000)
 	for {
@@ -138,7 +144,7 @@ func (w *TrackWriter) writeVP8() {
 		}
 		frame, _, err := w.ivf.ParseNextFrame()
 		if err == io.EOF {
-			logger.Infow("all video frames parsed and sent")
+			logger.Debugw("all video frames parsed and sent")
 			w.onWriteComplete()
 			return
 		}

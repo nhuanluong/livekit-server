@@ -4,41 +4,60 @@ import (
 	"context"
 	"time"
 
-	livekit "github.com/livekit/protocol/proto"
-
-	"github.com/livekit/livekit-server/pkg/routing"
-	"github.com/livekit/livekit-server/pkg/rtc"
+	"github.com/livekit/protocol/livekit"
 )
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -generate
 
 // encapsulates CRUD operations for room settings
-//counterfeiter:generate . RoomStore
-type RoomStore interface {
-	StoreRoom(ctx context.Context, room *livekit.Room) error
-	LoadRoom(ctx context.Context, idOrName string) (*livekit.Room, error)
-	ListRooms(ctx context.Context) ([]*livekit.Room, error)
-	DeleteRoom(ctx context.Context, idOrName string) error
+//
+//counterfeiter:generate . ObjectStore
+type ObjectStore interface {
+	ServiceStore
 
 	// enable locking on a specific room to prevent race
 	// returns a (lock uuid, error)
-	LockRoom(ctx context.Context, name string, duration time.Duration) (string, error)
-	UnlockRoom(ctx context.Context, name string, uid string) error
+	LockRoom(ctx context.Context, roomName livekit.RoomName, duration time.Duration) (string, error)
+	UnlockRoom(ctx context.Context, roomName livekit.RoomName, uid string) error
 
-	StoreParticipant(ctx context.Context, roomName string, participant *livekit.ParticipantInfo) error
-	LoadParticipant(ctx context.Context, roomName, identity string) (*livekit.ParticipantInfo, error)
-	ListParticipants(ctx context.Context, roomName string) ([]*livekit.ParticipantInfo, error)
-	DeleteParticipant(ctx context.Context, roomName, identity string) error
+	StoreRoom(ctx context.Context, room *livekit.Room, internal *livekit.RoomInternal) error
+	DeleteRoom(ctx context.Context, roomName livekit.RoomName) error
+
+	StoreParticipant(ctx context.Context, roomName livekit.RoomName, participant *livekit.ParticipantInfo) error
+	DeleteParticipant(ctx context.Context, roomName livekit.RoomName, identity livekit.ParticipantIdentity) error
 }
 
-type RoomManager interface {
-	RoomStore
+//counterfeiter:generate . ServiceStore
+type ServiceStore interface {
+	LoadRoom(ctx context.Context, roomName livekit.RoomName, includeInternal bool) (*livekit.Room, *livekit.RoomInternal, error)
 
-	GetRoom(ctx context.Context, roomName string) *rtc.Room
-	DeleteRoom(ctx context.Context, roomName string) error
-	StartSession(ctx context.Context, roomName string, pi routing.ParticipantInit, requestSource routing.MessageSource, responseSink routing.MessageSink)
-	CleanupRooms() error
-	CloseIdleRooms()
-	HasParticipants() bool
-	Stop()
+	// ListRooms returns currently active rooms. if names is not nil, it'll filter and return
+	// only rooms that match
+	ListRooms(ctx context.Context, roomNames []livekit.RoomName) ([]*livekit.Room, error)
+	LoadParticipant(ctx context.Context, roomName livekit.RoomName, identity livekit.ParticipantIdentity) (*livekit.ParticipantInfo, error)
+	ListParticipants(ctx context.Context, roomName livekit.RoomName) ([]*livekit.ParticipantInfo, error)
+}
+
+//counterfeiter:generate . EgressStore
+type EgressStore interface {
+	StoreEgress(ctx context.Context, info *livekit.EgressInfo) error
+	LoadEgress(ctx context.Context, egressID string) (*livekit.EgressInfo, error)
+	ListEgress(ctx context.Context, roomName livekit.RoomName) ([]*livekit.EgressInfo, error)
+	UpdateEgress(ctx context.Context, info *livekit.EgressInfo) error
+}
+
+//counterfeiter:generate . IngressStore
+type IngressStore interface {
+	StoreIngress(ctx context.Context, info *livekit.IngressInfo) error
+	LoadIngress(ctx context.Context, ingressID string) (*livekit.IngressInfo, error)
+	LoadIngressFromStreamKey(ctx context.Context, streamKey string) (*livekit.IngressInfo, error)
+	ListIngress(ctx context.Context, roomName livekit.RoomName) ([]*livekit.IngressInfo, error)
+	UpdateIngress(ctx context.Context, info *livekit.IngressInfo) error
+	UpdateIngressState(ctx context.Context, ingressId string, state *livekit.IngressState) error
+	DeleteIngress(ctx context.Context, info *livekit.IngressInfo) error
+}
+
+//counterfeiter:generate . RoomAllocator
+type RoomAllocator interface {
+	CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest) (*livekit.Room, error)
 }

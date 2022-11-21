@@ -11,88 +11,108 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/livekit/protocol/logger"
 	"github.com/urfave/cli/v2"
 
-	"github.com/livekit/livekit-server/pkg/config"
 	serverlogger "github.com/livekit/livekit-server/pkg/logger"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
+	"github.com/livekit/protocol/logger"
+
+	"github.com/livekit/livekit-server/pkg/config"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/service"
 	"github.com/livekit/livekit-server/version"
 )
+
+var baseFlags = []cli.Flag{
+	&cli.StringSliceFlag{
+		Name:  "bind",
+		Usage: "IP address to listen on, use flag multiple times to specify multiple addresses",
+	},
+	&cli.StringFlag{
+		Name:  "config",
+		Usage: "path to LiveKit config file",
+	},
+	&cli.StringFlag{
+		Name:    "config-body",
+		Usage:   "LiveKit config in YAML, typically passed in as an environment var in a container",
+		EnvVars: []string{"LIVEKIT_CONFIG"},
+	},
+	&cli.StringFlag{
+		Name:  "key-file",
+		Usage: "path to file that contains API keys/secrets",
+	},
+	&cli.StringFlag{
+		Name:    "keys",
+		Usage:   "api keys (key: secret\\n)",
+		EnvVars: []string{"LIVEKIT_KEYS"},
+	},
+	&cli.StringFlag{
+		Name:    "region",
+		Usage:   "region of the current node. Used by regionaware node selector",
+		EnvVars: []string{"LIVEKIT_REGION"},
+	},
+	&cli.StringFlag{
+		Name:    "node-ip",
+		Usage:   "IP address of the current node, used to advertise to clients. Automatically determined by default",
+		EnvVars: []string{"NODE_IP"},
+	},
+	&cli.IntFlag{
+		Name:    "udp-port",
+		Usage:   "Single UDP port to use for WebRTC traffic",
+		EnvVars: []string{"UDP_PORT"},
+	},
+	&cli.StringFlag{
+		Name:    "redis-host",
+		Usage:   "host (incl. port) to redis server",
+		EnvVars: []string{"REDIS_HOST"},
+	},
+	&cli.StringFlag{
+		Name:    "redis-password",
+		Usage:   "password to redis",
+		EnvVars: []string{"REDIS_PASSWORD"},
+	},
+	&cli.StringFlag{
+		Name:    "turn-cert",
+		Usage:   "tls cert file for TURN server",
+		EnvVars: []string{"LIVEKIT_TURN_CERT"},
+	},
+	&cli.StringFlag{
+		Name:    "turn-key",
+		Usage:   "tls key file for TURN server",
+		EnvVars: []string{"LIVEKIT_TURN_KEY"},
+	},
+	// debugging flags
+	&cli.StringFlag{
+		Name:  "memprofile",
+		Usage: "write memory profile to `file`",
+	},
+	&cli.BoolFlag{
+		Name:  "dev",
+		Usage: "sets log-level to debug, console formatter, and /debug/pprof. insecure for production",
+	},
+	&cli.BoolFlag{
+		Name:   "disable-strict-config",
+		Usage:  "disables strict config parsing",
+		Hidden: true,
+	},
+}
 
 func init() {
 	rand.Seed(time.Now().Unix())
 }
 
 func main() {
+	generatedFlags, err := config.GenerateCLIFlags(baseFlags, true)
+	if err != nil {
+		fmt.Println(err)
+	}
+
 	app := &cli.App{
 		Name:        "livekit-server",
-		Usage:       "distributed audio/video rooms over WebRTC",
+		Usage:       "High performance WebRTC server",
 		Description: "run without subcommands to start the server",
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:  "config",
-				Usage: "path to LiveKit config file",
-			},
-			&cli.StringFlag{
-				Name:    "config-body",
-				Usage:   "LiveKit config in YAML, typically passed in as an environment var in a container",
-				EnvVars: []string{"LIVEKIT_CONFIG"},
-			},
-			&cli.StringFlag{
-				Name:  "key-file",
-				Usage: "path to file that contains API keys/secrets",
-			},
-			&cli.StringFlag{
-				Name:    "keys",
-				Usage:   "api keys (key: secret\\n)",
-				EnvVars: []string{"LIVEKIT_KEYS"},
-			},
-			&cli.StringFlag{
-				Name:    "region",
-				Usage:   "region of the current node. Used by regionaware node selector",
-				EnvVars: []string{"LIVEKIT_REGION"},
-			},
-			&cli.StringFlag{
-				Name:    "node-ip",
-				Usage:   "IP address of the current node, used to advertise to clients. Automatically determined by default",
-				EnvVars: []string{"NODE_IP"},
-			},
-			&cli.StringFlag{
-				Name:    "redis-host",
-				Usage:   "host (incl. port) to redis server",
-				EnvVars: []string{"REDIS_HOST"},
-			},
-			&cli.StringFlag{
-				Name:    "redis-password",
-				Usage:   "password to redis",
-				EnvVars: []string{"REDIS_PASSWORD"},
-			},
-			&cli.StringFlag{
-				Name:  "cpuprofile",
-				Usage: "write cpu profile to `file`",
-			},
-			&cli.StringFlag{
-				Name:  "memprofile",
-				Usage: "write memory profile to `file`",
-			},
-			&cli.BoolFlag{
-				Name:  "dev",
-				Usage: "sets log-level to debug, and console formatter",
-			},
-			&cli.StringFlag{
-				Name:    "turn-cert",
-				Usage:   "tls cert file for TURN server",
-				EnvVars: []string{"LIVEKIT_TURN_CERT"},
-			},
-			&cli.StringFlag{
-				Name:    "turn-key",
-				Usage:   "tls key file for TURN server",
-				EnvVars: []string{"LIVEKIT_TURN_KEY"},
-			},
-		},
-		Action: startServer,
+		Flags:       append(baseFlags, generatedFlags...),
+		Action:      startServer,
 		Commands: []*cli.Command{
 			{
 				Name:   "generate-keys",
@@ -105,7 +125,9 @@ func main() {
 				Action: printPorts,
 			},
 			{
+				// this subcommand is deprecated, token generation is provided by CLI
 				Name:   "create-join-token",
+				Hidden: true,
 				Usage:  "create a room join token for development use",
 				Action: createToken,
 				Flags: []cli.Flag{
@@ -131,6 +153,11 @@ func main() {
 				Usage:  "list all nodes",
 				Action: listNodes,
 			},
+			{
+				Name:   "hidden-help",
+				Usage:  "prints app help and includes all hidden generated configuration flags",
+				Action: hiddenHelp,
+			},
 		},
 		Version: version.Version,
 	}
@@ -146,36 +173,52 @@ func getConfig(c *cli.Context) (*config.Config, error) {
 		return nil, err
 	}
 
-	return config.NewConfig(confString, c)
+	strictMode := true
+	if c.Bool("disable-strict-config") {
+		strictMode = false
+	}
+
+	conf, err := config.NewConfig(confString, strictMode, c, baseFlags)
+	if err != nil {
+		return nil, err
+	}
+	serverlogger.InitFromConfig(conf.Logging)
+
+	if c.String("config") == "" && c.String("config-body") == "" && conf.Development {
+		// use single port UDP when no config is provided
+		conf.RTC.UDPPort = 7882
+		conf.RTC.ICEPortRangeStart = 0
+		conf.RTC.ICEPortRangeEnd = 0
+		logger.Infow("starting in development mode")
+
+		if len(conf.Keys) == 0 {
+			logger.Infow("no keys provided, using placeholder keys",
+				"API Key", "devkey",
+				"API Secret", "secret",
+			)
+			conf.Keys = map[string]string{
+				"devkey": "secret",
+			}
+			// when dev mode and using shared keys, we'll bind to localhost by default
+			if conf.BindAddresses == nil {
+				conf.BindAddresses = []string{
+					"127.0.0.1",
+					"[::1]",
+				}
+			}
+		}
+	}
+	return conf, nil
 }
 
 func startServer(c *cli.Context) error {
 	rand.Seed(time.Now().UnixNano())
 
-	cpuProfile := c.String("cpuprofile")
 	memProfile := c.String("memprofile")
 
 	conf, err := getConfig(c)
 	if err != nil {
 		return err
-	}
-
-	if conf.Development {
-		serverlogger.InitDevelopment(conf.LogLevel)
-	} else {
-		serverlogger.InitProduction(conf.LogLevel)
-	}
-
-	if cpuProfile != "" {
-		if f, err := os.Create(cpuProfile); err != nil {
-			return err
-		} else {
-			defer f.Close()
-			if err := pprof.StartCPUProfile(f); err != nil {
-				return err
-			}
-			defer pprof.StopCPUProfile()
-		}
 	}
 
 	if memProfile != "" {
@@ -195,6 +238,8 @@ func startServer(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	prometheus.Init(currentNode.Id)
 
 	server, err := service.InitializeServer(conf, currentNode)
 	if err != nil {

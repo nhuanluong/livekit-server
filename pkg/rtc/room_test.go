@@ -1,18 +1,25 @@
-package rtc_test
+package rtc
 
 import (
 	"fmt"
 	"testing"
 	"time"
 
-	livekit "github.com/livekit/protocol/proto"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/livekit/livekit-server/version"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/webhook"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	serverlogger "github.com/livekit/livekit-server/pkg/logger"
-	"github.com/livekit/livekit-server/pkg/rtc"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/rtc/types/typesfakes"
+	"github.com/livekit/livekit-server/pkg/sfu/audio"
+	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/livekit-server/pkg/telemetry/telemetryfakes"
 	"github.com/livekit/livekit-server/pkg/testutils"
 )
 
@@ -23,8 +30,12 @@ const (
 )
 
 func init() {
-	serverlogger.InitDevelopment("")
+	serverlogger.InitFromConfig(config.LoggingConfig{
+		Config: logger.Config{Level: "debug"},
+	})
 }
+
+var iceServersForRoom = []*livekit.ICEServer{{Urls: []string{"stun:stun.l.google.com:19302"}}}
 
 func TestJoinedState(t *testing.T) {
 	t.Run("new room should return joinedAt 0", func(t *testing.T) {
@@ -36,7 +47,7 @@ func TestJoinedState(t *testing.T) {
 	t.Run("should be current time when a participant joins", func(t *testing.T) {
 		s := time.Now().Unix()
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 1})
-		require.Equal(t, s, rm.FirstJoinedAt())
+		require.LessOrEqual(t, s, rm.FirstJoinedAt())
 		require.Equal(t, int64(0), rm.LastLeftAt())
 	})
 
@@ -44,14 +55,14 @@ func TestJoinedState(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 1})
 		p0 := rm.GetParticipants()[0]
 		s := time.Now().Unix()
-		rm.RemoveParticipant(p0.Identity())
-		require.Equal(t, s, rm.LastLeftAt())
+		rm.RemoveParticipant(p0.Identity(), types.ParticipantCloseReasonClientRequestLeave)
+		require.LessOrEqual(t, s, rm.LastLeftAt())
 	})
 
 	t.Run("LastLeftAt should not be set when there are still participants in the room", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
 		p0 := rm.GetParticipants()[0]
-		rm.RemoveParticipant(p0.Identity())
+		rm.RemoveParticipant(p0.Identity(), types.ParticipantCloseReasonClientRequestLeave)
 		require.EqualValues(t, 0, rm.LastLeftAt())
 	})
 }
@@ -59,24 +70,24 @@ func TestJoinedState(t *testing.T) {
 func TestRoomJoin(t *testing.T) {
 	t.Run("joining returns existing participant data", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: numParticipants})
-		pNew := newMockParticipant("new", types.DefaultProtocol, false)
+		pNew := newMockParticipant("new", types.CurrentProtocol, false, false)
 
-		rm.Join(pNew, nil)
+		_ = rm.Join(pNew, nil, iceServersForRoom)
 
 		// expect new participant to get a JoinReply
-		info, participants, iceServers := pNew.SendJoinResponseArgsForCall(0)
-		require.Equal(t, info.Sid, rm.Room.Sid)
-		require.Len(t, participants, numParticipants)
+		res := pNew.SendJoinResponseArgsForCall(0)
+		require.Equal(t, livekit.RoomID(res.Room.Sid), rm.ID())
+		require.Len(t, res.OtherParticipants, numParticipants)
 		require.Len(t, rm.GetParticipants(), numParticipants+1)
-		require.NotEmpty(t, iceServers)
+		require.NotEmpty(t, res.IceServers)
 	})
 
 	t.Run("subscribe to existing channels upon join", func(t *testing.T) {
 		numExisting := 3
 		rm := newRoomWithParticipants(t, testRoomOpts{num: numExisting})
-		p := newMockParticipant("new", types.DefaultProtocol, false)
+		p := newMockParticipant("new", types.CurrentProtocol, false, false)
 
-		err := rm.Join(p, &rtc.ParticipantOptions{AutoSubscribe: true})
+		err := rm.Join(p, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
 		require.NoError(t, err)
 
 		stateChangeCB := p.OnStateChangeArgsForCall(0)
@@ -89,25 +100,27 @@ func TestRoomJoin(t *testing.T) {
 			if p == op {
 				continue
 			}
-			mockP := op.(*typesfakes.FakeParticipant)
+			mockP := op.(*typesfakes.FakeLocalParticipant)
 			require.NotZero(t, mockP.AddSubscriberCallCount())
 			// last call should be to add the newest participant
-			require.Equal(t, p, mockP.AddSubscriberArgsForCall(mockP.AddSubscriberCallCount()-1))
+			sub, params := mockP.AddSubscriberArgsForCall(mockP.AddSubscriberCallCount() - 1)
+			require.Equal(t, p, sub)
+			require.Equal(t, types.AddSubscriberParams{AllTracks: true}, params)
 		}
 	})
 
 	t.Run("participant state change is broadcasted to others", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: numParticipants})
 		var changedParticipant types.Participant
-		rm.OnParticipantChanged(func(participant types.Participant) {
+		rm.OnParticipantChanged(func(participant types.LocalParticipant) {
 			changedParticipant = participant
 		})
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
-		disconnectedParticipant := participants[1].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
+		disconnectedParticipant := participants[1].(*typesfakes.FakeLocalParticipant)
 		disconnectedParticipant.StateReturns(livekit.ParticipantInfo_DISCONNECTED)
 
-		rm.RemoveParticipant(p.Identity())
+		rm.RemoveParticipant(p.Identity(), types.ParticipantCloseReasonStateDisconnected)
 		time.Sleep(defaultDelay)
 
 		require.Equal(t, p, changedParticipant)
@@ -118,7 +131,7 @@ func TestRoomJoin(t *testing.T) {
 				require.Zero(t, p.SendParticipantUpdateCallCount())
 				continue
 			}
-			fakeP := op.(*typesfakes.FakeParticipant)
+			fakeP := op.(*typesfakes.FakeLocalParticipant)
 			require.Equal(t, 1, fakeP.SendParticipantUpdateCallCount())
 			numUpdates += 1
 		}
@@ -127,11 +140,11 @@ func TestRoomJoin(t *testing.T) {
 
 	t.Run("cannot exceed max participants", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 1})
-		rm.Room.MaxParticipants = 1
-		p := newMockParticipant("second", types.ProtocolVersion(0), false)
+		rm.protoRoom.MaxParticipants = 1
+		p := newMockParticipant("second", types.ProtocolVersion(0), false, false)
 
-		err := rm.Join(p, nil)
-		require.Equal(t, rtc.ErrMaxParticipantsExceeded, err)
+		err := rm.Join(p, nil, iceServersForRoom)
+		require.Equal(t, ErrMaxParticipantsExceeded, err)
 	})
 }
 
@@ -140,26 +153,26 @@ func TestParticipantUpdate(t *testing.T) {
 	tests := []struct {
 		name         string
 		sendToSender bool // should sender receive it
-		action       func(p types.Participant)
+		action       func(p types.LocalParticipant)
 	}{
 		{
 			"track mutes are sent to everyone",
 			true,
-			func(p types.Participant) {
+			func(p types.LocalParticipant) {
 				p.SetTrackMuted("", true, false)
 			},
 		},
 		{
 			"track metadata updates are sent to everyone",
 			true,
-			func(p types.Participant) {
+			func(p types.LocalParticipant) {
 				p.SetMetadata("")
 			},
 		},
 		{
 			"track publishes are sent to existing participants",
 			true,
-			func(p types.Participant) {
+			func(p types.LocalParticipant) {
 				p.AddTrack(&livekit.AddTrackRequest{
 					Type: livekit.TrackType_VIDEO,
 				})
@@ -171,9 +184,9 @@ func TestParticipantUpdate(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			rm := newRoomWithParticipants(t, testRoomOpts{num: 3})
 			// remember how many times send has been called for each
-			callCounts := make(map[string]int)
+			callCounts := make(map[livekit.ParticipantID]int)
 			for _, p := range rm.GetParticipants() {
-				fp := p.(*typesfakes.FakeParticipant)
+				fp := p.(*typesfakes.FakeLocalParticipant)
 				callCounts[p.ID()] = fp.SendParticipantUpdateCallCount()
 			}
 
@@ -186,8 +199,125 @@ func TestParticipantUpdate(t *testing.T) {
 				if p != sender || test.sendToSender {
 					expected += 1
 				}
-				fp := p.(*typesfakes.FakeParticipant)
+				fp := p.(*typesfakes.FakeLocalParticipant)
 				require.Equal(t, expected, fp.SendParticipantUpdateCallCount())
+			}
+		})
+	}
+}
+
+func TestPushAndDequeueUpdates(t *testing.T) {
+	identity := "test_user"
+	publisher1v1 := &livekit.ParticipantInfo{
+		Identity:    identity,
+		Sid:         "1",
+		IsPublisher: true,
+		Version:     1,
+	}
+	publisher1v2 := &livekit.ParticipantInfo{
+		Identity:    identity,
+		Sid:         "1",
+		IsPublisher: true,
+		Version:     2,
+	}
+	publisher2 := &livekit.ParticipantInfo{
+		Identity:    identity,
+		Sid:         "2",
+		IsPublisher: true,
+		Version:     1,
+	}
+	subscriber1v1 := &livekit.ParticipantInfo{
+		Identity: identity,
+		Sid:      "1",
+		Version:  1,
+	}
+	subscriber1v2 := &livekit.ParticipantInfo{
+		Identity: identity,
+		Sid:      "1",
+		Version:  2,
+	}
+
+	requirePIEquals := func(t *testing.T, a, b *livekit.ParticipantInfo) {
+		require.Equal(t, a.Sid, b.Sid)
+		require.Equal(t, a.Identity, b.Identity)
+		require.Equal(t, a.Version, b.Version)
+	}
+	testCases := []struct {
+		name      string
+		pi        *livekit.ParticipantInfo
+		immediate bool
+		existing  *livekit.ParticipantInfo
+		expected  []*livekit.ParticipantInfo
+		validate  func(t *testing.T, rm *Room, updates []*livekit.ParticipantInfo)
+	}{
+		{
+			name:     "publisher updates are immediate",
+			pi:       publisher1v1,
+			expected: []*livekit.ParticipantInfo{publisher1v1},
+		},
+		{
+			name: "subscriber updates are queued",
+			pi:   subscriber1v1,
+		},
+		{
+			name:     "last version is enqueued",
+			pi:       subscriber1v2,
+			existing: subscriber1v1,
+			validate: func(t *testing.T, rm *Room, _ []*livekit.ParticipantInfo) {
+				queued := rm.batchedUpdates[livekit.ParticipantIdentity(identity)]
+				require.NotNil(t, queued)
+				requirePIEquals(t, subscriber1v2, queued)
+			},
+		},
+		{
+			name:     "out of order updates are rejected",
+			pi:       subscriber1v1,
+			existing: subscriber1v2,
+			validate: func(t *testing.T, rm *Room, updates []*livekit.ParticipantInfo) {
+				queued := rm.batchedUpdates[livekit.ParticipantIdentity(identity)]
+				requirePIEquals(t, subscriber1v2, queued)
+			},
+		},
+		{
+			name:     "sid change is broadcasted immediately",
+			pi:       publisher2,
+			existing: subscriber1v2,
+			expected: []*livekit.ParticipantInfo{
+				{
+					Identity: identity,
+					Sid:      "1",
+					Version:  2,
+					State:    livekit.ParticipantInfo_DISCONNECTED,
+				},
+				publisher2,
+			},
+		},
+		{
+			name:     "when switching to publisher, queue is cleared",
+			pi:       publisher1v2,
+			existing: subscriber1v1,
+			expected: []*livekit.ParticipantInfo{subscriber1v1, publisher1v2},
+			validate: func(t *testing.T, rm *Room, updates []*livekit.ParticipantInfo) {
+				require.Empty(t, rm.batchedUpdates)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rm := newRoomWithParticipants(t, testRoomOpts{num: 1})
+			if tc.existing != nil {
+				// clone the existing value since it can be modified when setting to disconnected
+				rm.batchedUpdates[livekit.ParticipantIdentity(tc.existing.Identity)] = proto.Clone(tc.existing).(*livekit.ParticipantInfo)
+			}
+			updates := rm.pushAndDequeueUpdates(tc.pi, tc.immediate)
+			require.Equal(t, len(tc.expected), len(updates))
+			for i, item := range tc.expected {
+				requirePIEquals(t, item, updates[i])
+			}
+
+			if tc.validate != nil {
+				tc.validate(t, rm, updates)
 			}
 		})
 	}
@@ -202,8 +332,8 @@ func TestRoomClosure(t *testing.T) {
 		})
 		p := rm.GetParticipants()[0]
 		// allows immediate close after
-		rm.Room.EmptyTimeout = 0
-		rm.RemoveParticipant(p.Identity())
+		rm.protoRoom.EmptyTimeout = 0
+		rm.RemoveParticipant(p.Identity(), types.ParticipantCloseReasonClientRequestLeave)
 
 		time.Sleep(defaultDelay)
 
@@ -211,7 +341,7 @@ func TestRoomClosure(t *testing.T) {
 		require.Len(t, rm.GetParticipants(), 0)
 		require.True(t, isClosed)
 
-		require.Equal(t, rtc.ErrRoomClosed, rm.Join(p, nil))
+		require.Equal(t, ErrRoomClosed, rm.Join(p, nil, iceServersForRoom))
 	})
 
 	t.Run("room does not close before empty timeout", func(t *testing.T) {
@@ -220,7 +350,7 @@ func TestRoomClosure(t *testing.T) {
 		rm.OnClose(func() {
 			isClosed = true
 		})
-		require.NotZero(t, rm.Room.EmptyTimeout)
+		require.NotZero(t, rm.protoRoom.EmptyTimeout)
 		rm.CloseIfEmpty()
 		require.False(t, isClosed)
 	})
@@ -231,7 +361,7 @@ func TestRoomClosure(t *testing.T) {
 		rm.OnClose(func() {
 			isClosed = true
 		})
-		rm.Room.EmptyTimeout = 1
+		rm.protoRoom.EmptyTimeout = 1
 
 		time.Sleep(1010 * time.Millisecond)
 		rm.CloseIfEmpty()
@@ -243,44 +373,43 @@ func TestNewTrack(t *testing.T) {
 	t.Run("new track should be added to ready participants", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 3})
 		participants := rm.GetParticipants()
-		p0 := participants[0].(*typesfakes.FakeParticipant)
+		p0 := participants[0].(*typesfakes.FakeLocalParticipant)
 		p0.StateReturns(livekit.ParticipantInfo_JOINED)
-		p1 := participants[1].(*typesfakes.FakeParticipant)
+		p1 := participants[1].(*typesfakes.FakeLocalParticipant)
 		p1.StateReturns(livekit.ParticipantInfo_ACTIVE)
 
-		pub := participants[2].(*typesfakes.FakeParticipant)
+		pub := participants[2].(*typesfakes.FakeLocalParticipant)
 
-		// p3 adds track
+		// pub adds track
 		track := newMockTrack(livekit.TrackType_VIDEO, "webcam")
 		trackCB := pub.OnTrackPublishedArgsForCall(0)
 		require.NotNil(t, trackCB)
 		trackCB(pub, track)
-		// only p2 should've been called
-		require.Equal(t, 1, track.AddSubscriberCallCount())
-		require.Equal(t, p1, track.AddSubscriberArgsForCall(0))
+		// only p1 should've been called
+		require.Equal(t, 1, pub.AddSubscriberCallCount())
+		sub, params := pub.AddSubscriberArgsForCall(pub.AddSubscriberCallCount() - 1)
+		require.Equal(t, p1, sub)
+		require.Equal(t, types.AddSubscriberParams{TrackIDs: []livekit.TrackID{track.ID()}}, params)
 	})
 }
 
 func TestActiveSpeakers(t *testing.T) {
 	t.Parallel()
-	getActiveSpeakerUpdates := func(p *typesfakes.FakeParticipant) []*livekit.ActiveSpeakerUpdate {
-		var updates []*livekit.ActiveSpeakerUpdate
-		numCalls := p.SendDataPacketCallCount()
+	getActiveSpeakerUpdates := func(p *typesfakes.FakeLocalParticipant) [][]*livekit.SpeakerInfo {
+		var updates [][]*livekit.SpeakerInfo
+		numCalls := p.SendSpeakerUpdateCallCount()
 		for i := 0; i < numCalls; i++ {
-			dp := p.SendDataPacketArgsForCall(i)
-			switch val := dp.Value.(type) {
-			case *livekit.DataPacket_Speaker:
-				updates = append(updates, val.Speaker)
-			}
+			infos := p.SendSpeakerUpdateArgsForCall(i)
+			updates = append(updates, infos)
 		}
 		return updates
 	}
 
 	audioUpdateDuration := (audioUpdateInterval + 10) * time.Millisecond
 	t.Run("participant should not be getting audio updates (protocol 2)", func(t *testing.T) {
-		rm := newRoomWithParticipants(t, testRoomOpts{num: 1, protocol: types.DefaultProtocol})
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 1, protocol: 2})
 		defer rm.Close()
-		p := rm.GetParticipants()[0].(*typesfakes.FakeParticipant)
+		p := rm.GetParticipants()[0].(*typesfakes.FakeLocalParticipant)
 		require.Empty(t, rm.GetActiveSpeakers())
 
 		time.Sleep(audioUpdateDuration)
@@ -289,105 +418,110 @@ func TestActiveSpeakers(t *testing.T) {
 		require.Empty(t, updates)
 	})
 
-	t.Run("speakers should be sorted by loudness (protocol 0)", func(t *testing.T) {
+	t.Run("speakers should be sorted by loudness", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
-		p2 := participants[1].(*typesfakes.FakeParticipant)
-		p.GetAudioLevelReturns(10, true)
-		p2.GetAudioLevelReturns(20, true)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
+		p2 := participants[1].(*typesfakes.FakeLocalParticipant)
+		p.GetAudioLevelReturns(20, true)
+		p2.GetAudioLevelReturns(10, true)
 
 		speakers := rm.GetActiveSpeakers()
 		require.Len(t, speakers, 2)
-		require.Equal(t, p.ID(), speakers[0].Sid)
-		require.Equal(t, p2.ID(), speakers[1].Sid)
+		require.Equal(t, string(p.ID()), speakers[0].Sid)
+		require.Equal(t, string(p2.ID()), speakers[1].Sid)
 	})
 
-	t.Run("participants are getting audio updates (protocol 2)", func(t *testing.T) {
-		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, protocol: types.DefaultProtocol})
+	t.Run("participants are getting audio updates (protocol 3+)", func(t *testing.T) {
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, protocol: 3})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
 		time.Sleep(time.Millisecond) // let the first update cycle run
 		p.GetAudioLevelReturns(30, true)
 
 		speakers := rm.GetActiveSpeakers()
 		require.NotEmpty(t, speakers)
-		require.Equal(t, p.ID(), speakers[0].Sid)
+		require.Equal(t, string(p.ID()), speakers[0].Sid)
 
-		testutils.WithTimeout(t, "ensure everyone has gotten an audio update", func() bool {
+		testutils.WithTimeout(t, func() string {
 			for _, op := range participants {
-				op := op.(*typesfakes.FakeParticipant)
+				op := op.(*typesfakes.FakeLocalParticipant)
 				updates := getActiveSpeakerUpdates(op)
 				if len(updates) == 0 {
-					return false
+					return fmt.Sprintf("%s did not get any audio updates", op.Identity())
 				}
 			}
-			return true
+			return ""
 		})
 
 		// no longer speaking, send update with empty items
 		p.GetAudioLevelReturns(127, false)
 
-		testutils.WithTimeout(t, "ensure no one is speaking", func() bool {
+		testutils.WithTimeout(t, func() string {
 			updates := getActiveSpeakerUpdates(p)
 			lastUpdate := updates[len(updates)-1]
-			return len(lastUpdate.Speakers) == 0
+			if len(lastUpdate) == 0 {
+				return "did not get updates of speaker going quiet"
+			}
+			if lastUpdate[0].Active {
+				return "speaker should not have been active"
+			}
+			return ""
 		})
 	})
 
 	t.Run("audio level is smoothed", func(t *testing.T) {
-		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, protocol: types.DefaultProtocol, audioSmoothIntervals: 3})
+		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, protocol: 3, audioSmoothIntervals: 3})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
-		op := participants[1].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
+		op := participants[1].(*typesfakes.FakeLocalParticipant)
 		p.GetAudioLevelReturns(30, true)
-		convertedLevel := rtc.ConvertAudioLevel(30)
+		convertedLevel := float32(audio.ConvertAudioLevel(30))
 
-		testutils.WithTimeout(t, "checking first update is received", func() bool {
+		testutils.WithTimeout(t, func() string {
 			updates := getActiveSpeakerUpdates(op)
 			if len(updates) == 0 {
-				return false
+				return "no speaker updates received"
 			}
-			lastSpeakers := updates[len(updates)-1].Speakers
+			lastSpeakers := updates[len(updates)-1]
 			if len(lastSpeakers) == 0 {
-				return false
+				return "no speakers in the update"
 			}
 			if lastSpeakers[0].Level > convertedLevel {
-				return true
+				return ""
 			}
-			return false
+			return "level mismatch"
 		})
 
-		testutils.WithTimeout(t, "eventually reaches actual levels", func() bool {
+		testutils.WithTimeout(t, func() string {
 			updates := getActiveSpeakerUpdates(op)
 			if len(updates) == 0 {
-				return false
+				return "no updates received"
 			}
-			lastSpeakers := updates[len(updates)-1].Speakers
+			lastSpeakers := updates[len(updates)-1]
 			if len(lastSpeakers) == 0 {
-				return false
+				return "no speakers found"
 			}
 			if lastSpeakers[0].Level > convertedLevel {
-				return true
+				return ""
 			}
-			return false
+			return "did not match expected levels"
 		})
 
 		p.GetAudioLevelReturns(127, false)
-
-		testutils.WithTimeout(t, "eventually goes back to 0", func() bool {
+		testutils.WithTimeout(t, func() string {
 			updates := getActiveSpeakerUpdates(op)
 			if len(updates) == 0 {
-				return false
+				return "no speaker updates received"
 			}
-			lastSpeakers := updates[len(updates)-1].Speakers
-			if len(lastSpeakers) == 0 {
-				return true
+			lastSpeakers := updates[len(updates)-1]
+			if len(lastSpeakers) == 1 && !lastSpeakers[0].Active {
+				return ""
 			}
-			return false
+			return "speakers didn't go back to zero"
 		})
 	})
 }
@@ -399,13 +533,13 @@ func TestDataChannel(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 3})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
 
 		packet := livekit.DataPacket{
 			Kind: livekit.DataPacket_RELIABLE,
 			Value: &livekit.DataPacket_User{
 				User: &livekit.UserPacket{
-					ParticipantSid: p.ID(),
+					ParticipantSid: string(p.ID()),
 					Payload:        []byte("message.."),
 				},
 			},
@@ -414,7 +548,7 @@ func TestDataChannel(t *testing.T) {
 
 		// ensure everyone has received the packet
 		for _, op := range participants {
-			fp := op.(*typesfakes.FakeParticipant)
+			fp := op.(*typesfakes.FakeLocalParticipant)
 			if fp == p {
 				require.Zero(t, fp.SendDataPacketCallCount())
 				continue
@@ -428,16 +562,16 @@ func TestDataChannel(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 4})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
-		p1 := participants[1].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
+		p1 := participants[1].(*typesfakes.FakeLocalParticipant)
 
 		packet := livekit.DataPacket{
 			Kind: livekit.DataPacket_RELIABLE,
 			Value: &livekit.DataPacket_User{
 				User: &livekit.UserPacket{
-					ParticipantSid:  p.ID(),
+					ParticipantSid:  string(p.ID()),
 					Payload:         []byte("message to p1.."),
-					DestinationSids: []string{p1.ID()},
+					DestinationSids: []string{string(p1.ID())},
 				},
 			},
 		}
@@ -445,7 +579,7 @@ func TestDataChannel(t *testing.T) {
 
 		// only p1 should receive the data
 		for _, op := range participants {
-			fp := op.(*typesfakes.FakeParticipant)
+			fp := op.(*typesfakes.FakeLocalParticipant)
 			if fp != p1 {
 				require.Zero(t, fp.SendDataPacketCallCount())
 			}
@@ -458,7 +592,7 @@ func TestDataChannel(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2})
 		defer rm.Close()
 		participants := rm.GetParticipants()
-		p := participants[0].(*typesfakes.FakeParticipant)
+		p := participants[0].(*typesfakes.FakeLocalParticipant)
 		p.CanPublishDataReturns(false)
 
 		packet := livekit.DataPacket{
@@ -469,11 +603,13 @@ func TestDataChannel(t *testing.T) {
 				},
 			},
 		}
-		p.OnDataPacketArgsForCall(0)(p, &packet)
+		if p.CanPublishData() {
+			p.OnDataPacketArgsForCall(0)(p, &packet)
+		}
 
 		// no one should've been sent packet
 		for _, op := range participants {
-			fp := op.(*typesfakes.FakeParticipant)
+			fp := op.(*typesfakes.FakeLocalParticipant)
 			require.Zero(t, fp.SendDataPacketCallCount())
 		}
 	})
@@ -484,22 +620,23 @@ func TestHiddenParticipants(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, numHidden: 1})
 		defer rm.Close()
 
-		pNew := newMockParticipant("new", types.DefaultProtocol, false)
-		rm.Join(pNew, nil)
+		pNew := newMockParticipant("new", types.CurrentProtocol, false, false)
+		rm.Join(pNew, nil, iceServersForRoom)
 
 		// expect new participant to get a JoinReply
-		info, participants, iceServers := pNew.SendJoinResponseArgsForCall(0)
-		require.Equal(t, info.Sid, rm.Room.Sid)
-		require.Len(t, participants, 2)
+		res := pNew.SendJoinResponseArgsForCall(0)
+		require.Equal(t, livekit.RoomID(res.Room.Sid), rm.ID())
+		require.Len(t, res.OtherParticipants, 2)
 		require.Len(t, rm.GetParticipants(), 4)
-		require.NotEmpty(t, iceServers)
+		require.NotEmpty(t, res.IceServers)
+		require.Equal(t, "testregion", res.ServerRegion)
 	})
 
 	t.Run("hidden participant subscribes to tracks", func(t *testing.T) {
 		rm := newRoomWithParticipants(t, testRoomOpts{num: 2, numHidden: 1})
-		p := newMockParticipant("new", types.DefaultProtocol, false)
+		p := newMockParticipant("new", types.CurrentProtocol, false, true)
 
-		err := rm.Join(p, &rtc.ParticipantOptions{AutoSubscribe: true})
+		err := rm.Join(p, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
 		require.NoError(t, err)
 
 		stateChangeCB := p.OnStateChangeArgsForCall(0)
@@ -512,10 +649,12 @@ func TestHiddenParticipants(t *testing.T) {
 			if p == op {
 				continue
 			}
-			mockP := op.(*typesfakes.FakeParticipant)
+			mockP := op.(*typesfakes.FakeLocalParticipant)
 			require.NotZero(t, mockP.AddSubscriberCallCount())
 			// last call should be to add the newest participant
-			require.Equal(t, p, mockP.AddSubscriberArgsForCall(mockP.AddSubscriberCallCount()-1))
+			sub, params := mockP.AddSubscriberArgsForCall(mockP.AddSubscriberCallCount() - 1)
+			require.Equal(t, p, sub)
+			require.Equal(t, types.AddSubscriberParams{AllTracks: true}, params)
 		}
 	})
 }
@@ -528,7 +667,7 @@ func TestRoomUpdate(t *testing.T) {
 		rm.SetMetadata("test metadata...")
 
 		for _, op := range rm.GetParticipants() {
-			fp := op.(*typesfakes.FakeParticipant)
+			fp := op.(*typesfakes.FakeLocalParticipant)
 			require.Equal(t, 1, fp.SendRoomUpdateCallCount())
 		}
 	})
@@ -541,29 +680,32 @@ type testRoomOpts struct {
 	audioSmoothIntervals uint32
 }
 
-func newRoomWithParticipants(t *testing.T, opts testRoomOpts) *rtc.Room {
-	rm := rtc.NewRoom(
+func newRoomWithParticipants(t *testing.T, opts testRoomOpts) *Room {
+	rm := NewRoom(
 		&livekit.Room{Name: "room"},
-		rtc.WebRTCConfig{},
-		[]*livekit.ICEServer{
-			{
-				Urls: []string{
-					"stun:stun.l.google.com:19302",
-				},
-			},
-		},
+		nil,
+		WebRTCConfig{},
 		&config.AudioConfig{
 			UpdateInterval:  audioUpdateInterval,
 			SmoothIntervals: opts.audioSmoothIntervals,
 		},
+		&livekit.ServerInfo{
+			Edition:  livekit.ServerInfo_Standard,
+			Version:  version.Version,
+			Protocol: types.CurrentProtocol,
+			NodeId:   "testnode",
+			Region:   "testregion",
+		},
+		telemetry.NewTelemetryService(webhook.NewNotifier("", "", nil), &telemetryfakes.FakeAnalyticsService{}),
+		nil,
 	)
 	for i := 0; i < opts.num+opts.numHidden; i++ {
-		identity := fmt.Sprintf("p%d", i)
-		participant := newMockParticipant(identity, opts.protocol, i >= opts.num)
-		err := rm.Join(participant, &rtc.ParticipantOptions{AutoSubscribe: true})
+		identity := livekit.ParticipantIdentity(fmt.Sprintf("p%d", i))
+		participant := newMockParticipant(identity, opts.protocol, i >= opts.num, true)
+		err := rm.Join(participant, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom)
+		require.NoError(t, err)
 		participant.StateReturns(livekit.ParticipantInfo_ACTIVE)
 		participant.IsReadyReturns(true)
-		require.NoError(t, err)
 	}
 	return rm
 }

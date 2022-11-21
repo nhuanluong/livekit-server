@@ -6,9 +6,11 @@ import (
 	"io"
 	"strings"
 
-	"github.com/livekit/protocol/logger"
-	livekit "github.com/livekit/protocol/proto"
+	"github.com/go-logr/logr"
 	"github.com/pion/webrtc/v3"
+
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 )
@@ -17,34 +19,34 @@ const (
 	trackIdSeparator = "|"
 )
 
-func UnpackStreamID(packed string) (participantId string, trackId string) {
+func UnpackStreamID(packed string) (participantID livekit.ParticipantID, trackID livekit.TrackID) {
 	parts := strings.Split(packed, trackIdSeparator)
 	if len(parts) > 1 {
-		return parts[0], packed[len(parts[0])+1:]
+		return livekit.ParticipantID(parts[0]), livekit.TrackID(packed[len(parts[0])+1:])
 	}
-	return packed, ""
+	return livekit.ParticipantID(packed), ""
 }
 
-func PackStreamID(participantId, trackId string) string {
-	return participantId + trackIdSeparator + trackId
+func PackStreamID(participantID livekit.ParticipantID, trackID livekit.TrackID) string {
+	return string(participantID) + trackIdSeparator + string(trackID)
 }
 
-func PackDataTrackLabel(participantId, trackId string, label string) string {
-	return participantId + trackIdSeparator + trackId + trackIdSeparator + label
+func PackDataTrackLabel(participantID livekit.ParticipantID, trackID livekit.TrackID, label string) string {
+	return string(participantID) + trackIdSeparator + string(trackID) + trackIdSeparator + label
 }
 
-func UnpackDataTrackLabel(packed string) (peerId string, trackId string, label string) {
+func UnpackDataTrackLabel(packed string) (participantID livekit.ParticipantID, trackID livekit.TrackID, label string) {
 	parts := strings.Split(packed, trackIdSeparator)
 	if len(parts) != 3 {
-		return "", packed, ""
+		return "", livekit.TrackID(packed), ""
 	}
-	peerId = parts[0]
-	trackId = parts[1]
+	participantID = livekit.ParticipantID(parts[0])
+	trackID = livekit.TrackID(parts[1])
 	label = parts[2]
 	return
 }
 
-func ToProtoParticipants(participants []types.Participant) []*livekit.ParticipantInfo {
+func ToProtoParticipants(participants []types.LocalParticipant) []*livekit.ParticipantInfo {
 	infos := make([]*livekit.ParticipantInfo, 0, len(participants))
 	for _, op := range participants {
 		infos = append(infos, op.ToProto())
@@ -122,6 +124,57 @@ func Recover() {
 		default:
 			err = errors.New("unknown panic")
 		}
-		logger.GetLogger().Error(err, "recovered panic", "panic", r)
+		logger.Errorw("recovered panic", err, "panic", r)
 	}
+}
+
+// logger helpers
+func LoggerWithParticipant(l logger.Logger, identity livekit.ParticipantIdentity, sid livekit.ParticipantID, isRemote bool) logger.Logger {
+	lr := logr.Logger(l)
+	if identity != "" {
+		lr = lr.WithValues("participant", identity)
+	}
+	if sid != "" {
+		lr = lr.WithValues("pID", sid)
+	}
+	lr = lr.WithValues("remote", isRemote)
+	return logger.Logger(lr)
+}
+
+func LoggerWithRoom(l logger.Logger, name livekit.RoomName, roomID livekit.RoomID) logger.Logger {
+	lr := logr.Logger(l)
+	if name != "" {
+		lr = lr.WithValues("room", name)
+	}
+	if roomID != "" {
+		lr = lr.WithValues("roomID", roomID)
+	}
+	return logger.Logger(lr)
+}
+
+func LoggerWithTrack(l logger.Logger, trackID livekit.TrackID, isRelayed bool) logger.Logger {
+	lr := logr.Logger(l)
+	if trackID != "" {
+		lr = lr.WithValues("trackID", trackID)
+		lr = lr.WithValues("relayed", isRelayed)
+	}
+	return logger.Logger(lr)
+}
+
+func LoggerWithPCTarget(l logger.Logger, target livekit.SignalTarget) logger.Logger {
+	lr := logr.Logger(l)
+	if lr.GetSink() == nil {
+		return l
+	}
+
+	lr = lr.WithValues("transport", target)
+	return logger.Logger(lr)
+}
+
+func LoggerWithCodecMime(l logger.Logger, mime string) logger.Logger {
+	lr := logr.Logger(l)
+	if mime != "" {
+		lr = lr.WithValues("mime", mime)
+	}
+	return logger.Logger(lr)
 }

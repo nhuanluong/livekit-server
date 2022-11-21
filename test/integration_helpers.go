@@ -9,16 +9,18 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/livekit/protocol/auth"
-	"github.com/livekit/protocol/logger"
-	livekit "github.com/livekit/protocol/proto"
-	"github.com/livekit/protocol/utils"
 	"github.com/twitchtv/twirp"
+
+	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
 	serverlogger "github.com/livekit/livekit-server/pkg/logger"
 	"github.com/livekit/livekit-server/pkg/routing"
 	"github.com/livekit/livekit-server/pkg/service"
+	"github.com/livekit/livekit-server/pkg/telemetry/prometheus"
 	"github.com/livekit/livekit-server/pkg/testutils"
 	testclient "github.com/livekit/livekit-server/test/client"
 )
@@ -29,8 +31,8 @@ const (
 	testRoom          = "mytestroom"
 	defaultServerPort = 7880
 	secondServerPort  = 8880
-	nodeId1           = "node-1"
-	nodeId2           = "node-2"
+	nodeID1           = "node-1"
+	nodeID2           = "node-2"
 
 	syncDelay = 100 * time.Millisecond
 	// if there are deadlocks, it's helpful to set a short test timeout (i.e. go test -timeout=30s)
@@ -38,17 +40,19 @@ const (
 	// connectTimeout = 5000 * time.Second
 )
 
-var (
-	roomClient livekit.RoomService
-)
+var roomClient livekit.RoomService
 
 func init() {
-	serverlogger.InitDevelopment("")
+	serverlogger.InitFromConfig(config.LoggingConfig{
+		Config: logger.Config{Level: "debug"},
+	})
+
+	prometheus.Init("test")
 }
 
-func setupSingleNodeTest(name string, roomName string) (*service.LivekitServer, func()) {
+func setupSingleNodeTest(name string) (*service.LivekitServer, func()) {
 	logger.Infow("----------------STARTING TEST----------------", "test", name)
-	s := createSingleNodeServer()
+	s := createSingleNodeServer(nil)
 	go func() {
 		if err := s.Start(); err != nil {
 			logger.Errorw("server returned error", err)
@@ -57,11 +61,6 @@ func setupSingleNodeTest(name string, roomName string) (*service.LivekitServer, 
 
 	waitForServerToStart(s)
 
-	// create test room
-	_, err := roomClient.CreateRoom(contextWithCreateRoomToken(), &livekit.CreateRoomRequest{Name: roomName})
-	if err != nil {
-		panic(err)
-	}
 	return s, func() {
 		s.Stop(true)
 		logger.Infow("----------------FINISHING TEST----------------", "test", name)
@@ -70,8 +69,8 @@ func setupSingleNodeTest(name string, roomName string) (*service.LivekitServer, 
 
 func setupMultiNodeTest(name string) (*service.LivekitServer, *service.LivekitServer, func()) {
 	logger.Infow("----------------STARTING TEST----------------", "test", name)
-	s1 := createMultiNodeServer(utils.NewGuid(nodeId1), defaultServerPort)
-	s2 := createMultiNodeServer(utils.NewGuid(nodeId2), secondServerPort)
+	s1 := createMultiNodeServer(utils.NewGuid(nodeID1), defaultServerPort)
+	s2 := createMultiNodeServer(utils.NewGuid(nodeID2), secondServerPort)
 	go s1.Start()
 	go s2.Start()
 
@@ -86,9 +85,9 @@ func setupMultiNodeTest(name string) (*service.LivekitServer, *service.LivekitSe
 	}
 }
 
-func contextWithCreateRoomToken() context.Context {
+func contextWithToken(token string) context.Context {
 	header := make(http.Header)
-	testclient.SetAuthorizationToken(header, createRoomToken())
+	testclient.SetAuthorizationToken(header, token)
 	tctx, err := twirp.WithHTTPRequestHeaders(context.Background(), header)
 	if err != nil {
 		panic(err)
@@ -106,7 +105,11 @@ func waitForServerToStart(s *service.LivekitServer) {
 			panic("could not start server after timeout")
 		case <-time.After(10 * time.Millisecond):
 			if s.IsRunning() {
-				return
+				// ensure we can connect to it
+				res, err := http.Get(fmt.Sprintf("http://localhost:%d", s.HTTPPort()))
+				if err == nil && res.StatusCode == http.StatusOK {
+					return
+				}
 			}
 		}
 	}
@@ -132,20 +135,22 @@ func waitUntilConnected(t *testing.T, clients ...*testclient.RTCClient) {
 	}
 }
 
-func createSingleNodeServer() *service.LivekitServer {
+func createSingleNodeServer(configUpdater func(*config.Config)) *service.LivekitServer {
 	var err error
-	conf, err := config.NewConfig("", nil)
+	conf, err := config.NewConfig("", true, nil, nil)
 	if err != nil {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
-	conf.Development = true
 	conf.Keys = map[string]string{testApiKey: testApiSecret}
+	if configUpdater != nil {
+		configUpdater(conf)
+	}
 
 	currentNode, err := routing.NewLocalNode(conf)
 	if err != nil {
 		panic(fmt.Sprintf("could not create local node: %v", err))
 	}
-	currentNode.Id = utils.NewGuid(nodeId1)
+	currentNode.Id = utils.NewGuid(nodeID1)
 
 	s, err := service.InitializeServer(conf, currentNode)
 	if err != nil {
@@ -156,9 +161,9 @@ func createSingleNodeServer() *service.LivekitServer {
 	return s
 }
 
-func createMultiNodeServer(nodeId string, port uint32) *service.LivekitServer {
+func createMultiNodeServer(nodeID string, port uint32) *service.LivekitServer {
 	var err error
-	conf, err := config.NewConfig("", nil)
+	conf, err := config.NewConfig("", true, nil, nil)
 	if err != nil {
 		panic(fmt.Sprintf("could not create config: %v", err))
 	}
@@ -166,14 +171,13 @@ func createMultiNodeServer(nodeId string, port uint32) *service.LivekitServer {
 	conf.RTC.UDPPort = port + 1
 	conf.RTC.TCPPort = port + 2
 	conf.Redis.Address = "localhost:6379"
-	conf.Development = true
 	conf.Keys = map[string]string{testApiKey: testApiSecret}
 
 	currentNode, err := routing.NewLocalNode(conf)
 	if err != nil {
 		panic(err)
 	}
-	currentNode.Id = nodeId
+	currentNode.Id = nodeID
 
 	// redis routing and store
 	s, err := service.InitializeServer(conf, currentNode)
@@ -203,6 +207,23 @@ func createRTCClient(name string, port int, opts *testclient.Options) *testclien
 	return c
 }
 
+// creates a client and runs against server
+func createRTCClientWithToken(token string, port int, opts *testclient.Options) *testclient.RTCClient {
+	ws, err := testclient.NewWebSocketConn(fmt.Sprintf("ws://localhost:%d", port), token, opts)
+	if err != nil {
+		panic(err)
+	}
+
+	c, err := testclient.NewRTCClient(ws)
+	if err != nil {
+		panic(err)
+	}
+
+	go c.Run()
+
+	return c
+}
+
 func redisClient() *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
@@ -212,7 +233,21 @@ func redisClient() *redis.Client {
 func joinToken(room, name string) string {
 	at := auth.NewAccessToken(testApiKey, testApiSecret).
 		AddGrant(&auth.VideoGrant{RoomJoin: true, Room: room}).
-		SetIdentity(name)
+		SetIdentity(name).
+		SetName(name).
+		SetMetadata("metadata" + name)
+	t, err := at.ToJWT()
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func joinTokenWithGrant(name string, grant *auth.VideoGrant) string {
+	at := auth.NewAccessToken(testApiKey, testApiSecret).
+		AddGrant(grant).
+		SetIdentity(name).
+		SetName(name)
 	t, err := at.ToJWT()
 	if err != nil {
 		panic(err)
@@ -222,8 +257,27 @@ func joinToken(room, name string) string {
 
 func createRoomToken() string {
 	at := auth.NewAccessToken(testApiKey, testApiSecret).
-		AddGrant(&auth.VideoGrant{RoomCreate: true}).
-		SetIdentity("testuser")
+		AddGrant(&auth.VideoGrant{RoomCreate: true})
+	t, err := at.ToJWT()
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func adminRoomToken(name string) string {
+	at := auth.NewAccessToken(testApiKey, testApiSecret).
+		AddGrant(&auth.VideoGrant{RoomAdmin: true, Room: name})
+	t, err := at.ToJWT()
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func listRoomToken() string {
+	at := auth.NewAccessToken(testApiKey, testApiSecret).
+		AddGrant(&auth.VideoGrant{RoomList: true})
 	t, err := at.ToJWT()
 	if err != nil {
 		panic(err)

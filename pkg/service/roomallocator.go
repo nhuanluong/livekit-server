@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
-	livekit "github.com/livekit/protocol/proto"
 	"github.com/livekit/protocol/utils"
 
 	"github.com/livekit/livekit-server/pkg/config"
@@ -13,20 +13,20 @@ import (
 	"github.com/livekit/livekit-server/pkg/routing/selector"
 )
 
-type RoomAllocator struct {
+type StandardRoomAllocator struct {
 	config    *config.Config
 	router    routing.Router
 	selector  selector.NodeSelector
-	roomStore RoomStore
+	roomStore ObjectStore
 }
 
-func NewRoomAllocator(conf *config.Config, router routing.Router, rs RoomStore) (*RoomAllocator, error) {
+func NewRoomAllocator(conf *config.Config, router routing.Router, rs ObjectStore) (RoomAllocator, error) {
 	ns, err := selector.CreateNodeSelector(conf)
 	if err != nil {
 		return nil, err
 	}
 
-	return &RoomAllocator{
+	return &StandardRoomAllocator{
 		config:    conf,
 		router:    router,
 		selector:  ns,
@@ -36,17 +36,17 @@ func NewRoomAllocator(conf *config.Config, router routing.Router, rs RoomStore) 
 
 // CreateRoom creates a new room from a request and allocates it to a node to handle
 // it'll also monitor its state, and cleans it up when appropriate
-func (r *RoomAllocator) CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest) (*livekit.Room, error) {
-	token, err := r.roomStore.LockRoom(ctx, req.Name, 5*time.Second)
+func (r *StandardRoomAllocator) CreateRoom(ctx context.Context, req *livekit.CreateRoomRequest) (*livekit.Room, error) {
+	token, err := r.roomStore.LockRoom(ctx, livekit.RoomName(req.Name), 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		_ = r.roomStore.UnlockRoom(ctx, req.Name, token)
+		_ = r.roomStore.UnlockRoom(ctx, livekit.RoomName(req.Name), token)
 	}()
 
 	// find existing room and update it
-	rm, err := r.roomStore.LoadRoom(ctx, req.Name)
+	rm, internal, err := r.roomStore.LoadRoom(ctx, livekit.RoomName(req.Name), true)
 	if err == ErrRoomNotFound {
 		rm = &livekit.Room{
 			Sid:          utils.NewGuid(utils.RoomPrefix),
@@ -65,24 +65,36 @@ func (r *RoomAllocator) CreateRoom(ctx context.Context, req *livekit.CreateRoomR
 	if req.MaxParticipants > 0 {
 		rm.MaxParticipants = req.MaxParticipants
 	}
-	if err := r.roomStore.StoreRoom(ctx, rm); err != nil {
+	if req.Metadata != "" {
+		rm.Metadata = req.Metadata
+	}
+	if req.Egress != nil && req.Egress.Tracks != nil {
+		internal = &livekit.RoomInternal{TrackEgress: req.Egress.Tracks}
+	}
+
+	if err = r.roomStore.StoreRoom(ctx, rm, internal); err != nil {
 		return nil, err
 	}
 
 	// check if room already assigned
-	existing, err := r.router.GetNodeForRoom(ctx, rm.Name)
+	existing, err := r.router.GetNodeForRoom(ctx, livekit.RoomName(rm.Name))
 	if err != routing.ErrNotFound && err != nil {
 		return nil, err
 	}
 
 	// if already assigned and still available, keep it on that node
 	if err == nil && selector.IsAvailable(existing) {
+		// if node hosting the room is full, deny entry
+		if selector.LimitsReached(r.config.Limit, existing.Stats) {
+			return nil, routing.ErrNodeLimitReached
+		}
+
 		return rm, nil
 	}
 
 	// select a new node
-	nodeId := req.NodeId
-	if nodeId == "" {
+	nodeID := livekit.NodeID(req.NodeId)
+	if nodeID == "" {
 		nodes, err := r.router.ListNodes()
 		if err != nil {
 			return nil, err
@@ -93,14 +105,25 @@ func (r *RoomAllocator) CreateRoom(ctx context.Context, req *livekit.CreateRoomR
 			return nil, err
 		}
 
-		nodeId = node.Id
+		nodeID = livekit.NodeID(node.Id)
 	}
 
-	logger.Debugw("selected node for room", "room", rm.Name, "roomID", rm.Sid, "nodeID", nodeId)
-	err = r.router.SetNodeForRoom(ctx, rm.Name, nodeId)
+	logger.Infow("selected node for room", "room", rm.Name, "roomID", rm.Sid, "selectedNodeID", nodeID)
+	err = r.router.SetNodeForRoom(ctx, livekit.RoomName(rm.Name), nodeID)
 	if err != nil {
 		return nil, err
 	}
 
 	return rm, nil
+}
+
+func applyDefaultRoomConfig(room *livekit.Room, conf *config.RoomConfig) {
+	room.EmptyTimeout = conf.EmptyTimeout
+	room.MaxParticipants = conf.MaxParticipants
+	for _, codec := range conf.EnabledCodecs {
+		room.EnabledCodecs = append(room.EnabledCodecs, &livekit.Codec{
+			Mime:     codec.Mime,
+			FmtpLine: codec.FmtpLine,
+		})
+	}
 }

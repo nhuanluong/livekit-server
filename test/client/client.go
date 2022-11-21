@@ -12,47 +12,41 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	livekit "github.com/livekit/protocol/proto"
-	"github.com/livekit/protocol/utils"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 	"github.com/thoas/go-funk"
+	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
 	"github.com/livekit/livekit-server/pkg/rtc"
-)
-
-const (
-	lossyDataChannel    = "_lossy"
-	reliableDataChannel = "_reliable"
+	"github.com/livekit/livekit-server/pkg/rtc/types"
 )
 
 type RTCClient struct {
-	id         string
+	id         livekit.ParticipantID
 	conn       *websocket.Conn
 	publisher  *rtc.PCTransport
 	subscriber *rtc.PCTransport
 	// sid => track
 	localTracks        map[string]webrtc.TrackLocal
+	trackSenders       map[string]*webrtc.RTPSender
 	lock               sync.Mutex
 	wsLock             sync.Mutex
 	ctx                context.Context
 	cancel             context.CancelFunc
-	connected          utils.AtomicFlag
-	iceConnected       utils.AtomicFlag
 	me                 *webrtc.MediaEngine // optional, populated only when receiving tracks
-	subscribedTracks   map[string][]*webrtc.TrackRemote
+	subscribedTracks   map[livekit.ParticipantID][]*webrtc.TrackRemote
 	localParticipant   *livekit.ParticipantInfo
-	remoteParticipants map[string]*livekit.ParticipantInfo
+	remoteParticipants map[livekit.ParticipantID]*livekit.ParticipantInfo
 
-	reliableDC         *webrtc.DataChannel
-	reliableDCSub      *webrtc.DataChannel
-	lossyDC            *webrtc.DataChannel
-	lossyDCSub         *webrtc.DataChannel
-	publisherConnected utils.AtomicFlag
+	subscriberAsPrimary        atomic.Bool
+	publisherFullyEstablished  atomic.Bool
+	subscriberFullyEstablished atomic.Bool
+	pongReceivedAt             atomic.Int64
 
 	// tracks waiting to be acked, cid => trackInfo
 	pendingPublishedTracks map[string]*livekit.TrackInfo
@@ -60,10 +54,11 @@ type RTCClient struct {
 	pendingTrackWriters []*TrackWriter
 	OnConnected         func()
 	OnDataReceived      func(data []byte, sid string)
+	refreshToken        string
 
-	// map of track Id and last packet
-	lastPackets   map[string]*rtp.Packet
-	bytesReceived map[string]uint64
+	// map of livekit.ParticipantID and last packet
+	lastPackets   map[livekit.ParticipantID]*rtp.Packet
+	bytesReceived map[livekit.ParticipantID]uint64
 }
 
 var (
@@ -84,10 +79,11 @@ var (
 
 type Options struct {
 	AutoSubscribe bool
+	Publish       string
 }
 
 func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error) {
-	u, err := url.Parse(host + "/rtc?protocol=3")
+	u, err := url.Parse(host + "/rtc?protocol=7")
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +92,8 @@ func NewWebSocketConn(host, token string, opts *Options) (*websocket.Conn, error
 
 	connectUrl := u.String()
 	if opts != nil {
-		connectUrl = fmt.Sprintf("%s&auto_subscribe=%t", connectUrl, opts.AutoSubscribe)
+		connectUrl = fmt.Sprintf("%s&auto_subscribe=%t&publish=%s",
+			connectUrl, opts.AutoSubscribe, opts.Publish)
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(connectUrl, requestHeader)
 	return conn, err
@@ -112,18 +109,21 @@ func NewRTCClient(conn *websocket.Conn) (*RTCClient, error) {
 	c := &RTCClient{
 		conn:                   conn,
 		localTracks:            make(map[string]webrtc.TrackLocal),
+		trackSenders:           make(map[string]*webrtc.RTPSender),
 		pendingPublishedTracks: make(map[string]*livekit.TrackInfo),
-		subscribedTracks:       make(map[string][]*webrtc.TrackRemote),
-		remoteParticipants:     make(map[string]*livekit.ParticipantInfo),
+		subscribedTracks:       make(map[livekit.ParticipantID][]*webrtc.TrackRemote),
+		remoteParticipants:     make(map[livekit.ParticipantID]*livekit.ParticipantInfo),
 		me:                     &webrtc.MediaEngine{},
-		lastPackets:            make(map[string]*rtp.Packet),
-		bytesReceived:          make(map[string]uint64),
+		lastPackets:            make(map[livekit.ParticipantID]*rtp.Packet),
+		bytesReceived:          make(map[livekit.ParticipantID]uint64),
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
 	conf := rtc.WebRTCConfig{
 		Configuration: rtcConf,
 	}
+	conf.SettingEngine.SetLite(false)
+	conf.SettingEngine.SetAnsweringDTLSRole(webrtc.DTLSRoleClient)
 	codecs := []*livekit.Codec{
 		{
 			Mime: "audio/opus",
@@ -131,107 +131,110 @@ func NewRTCClient(conn *websocket.Conn) (*RTCClient, error) {
 		{
 			Mime: "video/vp8",
 		},
+		{
+			Mime: "video/h264",
+		},
 	}
+	//
+	// The signal targets are from point of view of server.
+	// From client side, they are flipped,
+	// i. e. the publisher transport on client side has SUBSCRIBER signal target (i. e. publisher is offerer).
+	// Same applies for subscriber transport also
+	//
 	c.publisher, err = rtc.NewPCTransport(rtc.TransportParams{
-		Target:        livekit.SignalTarget_PUBLISHER,
-		Config:        &conf,
-		EnabledCodecs: codecs,
+		Config:          &conf,
+		DirectionConfig: conf.Subscriber,
+		EnabledCodecs:   codecs,
+		IsOfferer:       true,
+		IsSendSide:      true,
 	})
 	if err != nil {
 		return nil, err
 	}
-	// intentionally use publisher transport to have codecs pre-registered
 	c.subscriber, err = rtc.NewPCTransport(rtc.TransportParams{
-		Target:        livekit.SignalTarget_PUBLISHER,
-		Config:        &conf,
-		EnabledCodecs: codecs,
+		Config:          &conf,
+		DirectionConfig: conf.Publisher,
+		EnabledCodecs:   codecs,
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	c.publisher.OnICECandidate(func(ic *webrtc.ICECandidate) error {
+		if ic == nil {
+			return nil
+		}
+		return c.SendIceCandidate(ic, livekit.SignalTarget_PUBLISHER)
+	})
+	c.publisher.OnOffer(c.onOffer)
+	c.publisher.OnFullyEstablished(func() {
+		logger.Debugw("publisher fully established", "participant", c.localParticipant.Identity, "pID", c.localParticipant.Sid)
+		c.publisherFullyEstablished.Store(true)
+	})
+
 	ordered := true
-	c.reliableDC, err = c.publisher.PeerConnection().CreateDataChannel(reliableDataChannel,
-		&webrtc.DataChannelInit{Ordered: &ordered},
-	)
-	if err != nil {
+	if err := c.publisher.CreateDataChannel(rtc.ReliableDataChannel, &webrtc.DataChannelInit{
+		Ordered: &ordered,
+	}); err != nil {
 		return nil, err
 	}
 
 	maxRetransmits := uint16(0)
-	c.lossyDC, err = c.publisher.PeerConnection().CreateDataChannel(lossyDataChannel,
-		&webrtc.DataChannelInit{Ordered: &ordered, MaxRetransmits: &maxRetransmits},
-	)
-	if err != nil {
+	if err := c.publisher.CreateDataChannel(rtc.LossyDataChannel, &webrtc.DataChannelInit{
+		Ordered:        &ordered,
+		MaxRetransmits: &maxRetransmits,
+	}); err != nil {
 		return nil, err
 	}
 
-	c.publisher.PeerConnection().OnICECandidate(func(ic *webrtc.ICECandidate) {
+	c.subscriber.OnICECandidate(func(ic *webrtc.ICECandidate) error {
 		if ic == nil {
-			return
+			return nil
 		}
-		c.SendIceCandidate(ic, livekit.SignalTarget_PUBLISHER)
+		return c.SendIceCandidate(ic, livekit.SignalTarget_SUBSCRIBER)
 	})
-	c.subscriber.PeerConnection().OnICECandidate(func(ic *webrtc.ICECandidate) {
-		if ic == nil {
-			return
-		}
-		c.SendIceCandidate(ic, livekit.SignalTarget_SUBSCRIBER)
-	})
-
-	c.subscriber.PeerConnection().OnTrack(func(track *webrtc.TrackRemote, rtpReceiver *webrtc.RTPReceiver) {
+	c.subscriber.OnTrack(func(track *webrtc.TrackRemote, rtpReceiver *webrtc.RTPReceiver) {
 		go c.processTrack(track)
 	})
-	c.subscriber.PeerConnection().OnDataChannel(func(channel *webrtc.DataChannel) {
-		if channel.Label() == reliableDataChannel {
-			c.reliableDCSub = channel
-		} else if channel.Label() == lossyDataChannel {
-			c.lossyDCSub = channel
-		} else {
-			return
-		}
-		channel.OnMessage(c.handleDataMessage)
-	})
+	c.subscriber.OnDataPacket(c.handleDataMessage)
+	c.subscriber.OnInitialConnected(func() {
+		logger.Debugw("subscriber initial connected", "participant", c.localParticipant.Identity)
 
-	c.publisher.OnOffer(c.onOffer)
-
-	c.subscriber.PeerConnection().OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
-		logger.Infow("subscriber ICE state has changed", "state", connectionState.String(),
-			"participant", c.localParticipant.Identity)
-		if connectionState == webrtc.ICEConnectionStateConnected {
-			// flush peers
-			c.lock.Lock()
-			defer c.lock.Unlock()
-			for _, tw := range c.pendingTrackWriters {
-				if err := tw.Start(); err != nil {
-					logger.Errorw("track writer error", err)
-				}
-			}
-
-			initialConnect := !c.iceConnected.Get()
-			c.pendingTrackWriters = nil
-			c.iceConnected.TrySet(true)
-
-			if initialConnect && c.OnConnected != nil {
-				go c.OnConnected()
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		for _, tw := range c.pendingTrackWriters {
+			if err := tw.Start(); err != nil {
+				logger.Errorw("track writer error", err)
 			}
 		}
-	})
 
-	c.publisher.PeerConnection().OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		logger.Infow("publisher ICE state changed", "state", state.String(),
-			"participant", c.localParticipant.Identity)
-		if state == webrtc.ICEConnectionStateConnected {
-			c.publisherConnected.TrySet(true)
-		} else {
-			c.publisherConnected.TrySet(false)
+		c.pendingTrackWriters = nil
+
+		if c.OnConnected != nil {
+			go c.OnConnected()
 		}
+	})
+	c.subscriber.OnFullyEstablished(func() {
+		logger.Debugw("subscriber fully established", "participant", c.localParticipant.Identity, "pID", c.localParticipant.Sid)
+		c.subscriberFullyEstablished.Store(true)
+	})
+	c.subscriber.OnAnswer(func(answer webrtc.SessionDescription) error {
+		// send remote an answer
+		logger.Infow("sending subscriber answer",
+			"participant", c.localParticipant.Identity,
+			// "sdp", answer,
+		)
+		return c.SendRequest(&livekit.SignalRequest{
+			Message: &livekit.SignalRequest_Answer{
+				Answer: rtc.ToProtoSessionDescription(answer),
+			},
+		})
 	})
 
 	return c, nil
 }
 
-func (c *RTCClient) ID() string {
+func (c *RTCClient) ID() livekit.ParticipantID {
 	return c.id
 }
 
@@ -256,16 +259,23 @@ func (c *RTCClient) Run() error {
 		switch msg := res.Message.(type) {
 		case *livekit.SignalResponse_Join:
 			c.localParticipant = msg.Join.Participant
-			c.id = msg.Join.Participant.Sid
+			c.id = livekit.ParticipantID(msg.Join.Participant.Sid)
 			c.lock.Lock()
 			for _, p := range msg.Join.OtherParticipants {
-				c.remoteParticipants[p.Sid] = p
+				c.remoteParticipants[livekit.ParticipantID(p.Sid)] = p
 			}
 			c.lock.Unlock()
+			// if publish only, negotiate
+			if !msg.Join.SubscriberPrimary {
+				c.subscriberAsPrimary.Store(false)
+				c.publisher.Negotiate(false)
+			} else {
+				c.subscriberAsPrimary.Store(true)
+			}
 
 			logger.Infow("join accepted, awaiting offer", "participant", msg.Join.Participant.Identity)
 		case *livekit.SignalResponse_Answer:
-			//logger.Debugw("received server answer",
+			// logger.Debugw("received server answer",
 			//	"participant", c.localParticipant.Identity,
 			//	"answer", msg.Answer.Sdp)
 			c.handleAnswer(rtc.FromProtoSessionDescription(msg.Answer))
@@ -274,57 +284,79 @@ func (c *RTCClient) Run() error {
 				"participant", c.localParticipant.Identity,
 			)
 			desc := rtc.FromProtoSessionDescription(msg.Offer)
-			if err := c.handleOffer(desc); err != nil {
-				return err
-			}
+			c.handleOffer(desc)
 		case *livekit.SignalResponse_Trickle:
 			candidateInit, err := rtc.FromProtoTrickle(msg.Trickle)
 			if err != nil {
 				return err
 			}
 			if msg.Trickle.Target == livekit.SignalTarget_PUBLISHER {
-				err = c.publisher.AddICECandidate(candidateInit)
+				c.publisher.AddICECandidate(candidateInit)
 			} else {
-				err = c.subscriber.AddICECandidate(candidateInit)
-			}
-			if err != nil {
-				return err
+				c.subscriber.AddICECandidate(candidateInit)
 			}
 		case *livekit.SignalResponse_Update:
-			participants := make(map[string]*livekit.ParticipantInfo)
+			c.lock.Lock()
 			for _, p := range msg.Update.Participants {
-				if p.State != livekit.ParticipantInfo_DISCONNECTED {
-					participants[p.Sid] = p
+				if livekit.ParticipantID(p.Sid) != c.id {
+					if p.State != livekit.ParticipantInfo_DISCONNECTED {
+						c.remoteParticipants[livekit.ParticipantID(p.Sid)] = p
+					} else {
+						delete(c.remoteParticipants, livekit.ParticipantID(p.Sid))
+					}
 				}
 			}
-			c.lock.Lock()
-			c.remoteParticipants = participants
 			c.lock.Unlock()
 
 		case *livekit.SignalResponse_TrackPublished:
-			logger.Debugw("track published", "track", msg.TrackPublished.Track.Name, "participant", c.localParticipant.Sid,
+			logger.Debugw("track published", "trackID", msg.TrackPublished.Track.Name, "participant", c.localParticipant.Sid,
 				"cid", msg.TrackPublished.Cid, "trackSid", msg.TrackPublished.Track.Sid)
 			c.lock.Lock()
 			c.pendingPublishedTracks[msg.TrackPublished.Cid] = msg.TrackPublished.Track
 			c.lock.Unlock()
+		case *livekit.SignalResponse_RefreshToken:
+			c.lock.Lock()
+			c.refreshToken = msg.RefreshToken
+			c.lock.Unlock()
+		case *livekit.SignalResponse_TrackUnpublished:
+			sid := msg.TrackUnpublished.TrackSid
+			c.lock.Lock()
+			sender := c.trackSenders[sid]
+			if sender != nil {
+				if err := c.publisher.RemoveTrack(sender); err != nil {
+					logger.Errorw("Could not unpublish track", err)
+				}
+				c.publisher.Negotiate(false)
+			}
+			delete(c.trackSenders, sid)
+			delete(c.localTracks, sid)
+			c.lock.Unlock()
+		case *livekit.SignalResponse_Pong:
+			c.pongReceivedAt.Store(msg.Pong)
 		}
 	}
 }
 
 func (c *RTCClient) WaitUntilConnected() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for {
 		select {
 		case <-ctx.Done():
-			id := c.ID()
+			id := string(c.ID())
 			if c.localParticipant != nil {
 				id = c.localParticipant.Identity
 			}
 			return fmt.Errorf("%s could not connect after timeout", id)
 		case <-time.After(10 * time.Millisecond):
-			if c.iceConnected.Get() {
-				return nil
+			if c.subscriberAsPrimary.Load() {
+				if c.subscriberFullyEstablished.Load() {
+					return nil
+				}
+			} else {
+				if c.publisherFullyEstablished.Load() {
+					return nil
+				}
 			}
 		}
 	}
@@ -345,7 +377,7 @@ func (c *RTCClient) ReadResponse() (*livekit.SignalResponse, error) {
 		msg := &livekit.SignalResponse{}
 		switch messageType {
 		case websocket.PingMessage:
-			c.conn.WriteMessage(websocket.PongMessage, nil)
+			_ = c.conn.WriteMessage(websocket.PongMessage, nil)
 			continue
 		case websocket.BinaryMessage:
 			// protobuf encoded
@@ -357,11 +389,11 @@ func (c *RTCClient) ReadResponse() (*livekit.SignalResponse, error) {
 	}
 }
 
-func (c *RTCClient) SubscribedTracks() map[string][]*webrtc.TrackRemote {
+func (c *RTCClient) SubscribedTracks() map[livekit.ParticipantID][]*webrtc.TrackRemote {
 	// create a copy of this
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	tracks := make(map[string][]*webrtc.TrackRemote, len(c.subscribedTracks))
+	tracks := make(map[livekit.ParticipantID][]*webrtc.TrackRemote, len(c.subscribedTracks))
 	for key, val := range c.subscribedTracks {
 		tracks[key] = val
 	}
@@ -374,6 +406,12 @@ func (c *RTCClient) RemoteParticipants() []*livekit.ParticipantInfo {
 	return funk.Values(c.remoteParticipants).([]*livekit.ParticipantInfo)
 }
 
+func (c *RTCClient) GetRemoteParticipant(sid livekit.ParticipantID) *livekit.ParticipantInfo {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return c.remoteParticipants[sid]
+}
+
 func (c *RTCClient) Stop() {
 	logger.Infow("stopping client", "ID", c.ID())
 	_ = c.SendRequest(&livekit.SignalRequest{
@@ -381,12 +419,30 @@ func (c *RTCClient) Stop() {
 			Leave: &livekit.LeaveRequest{},
 		},
 	})
-	c.connected.TrySet(false)
-	c.iceConnected.TrySet(false)
-	c.conn.Close()
+	c.publisherFullyEstablished.Store(false)
+	c.subscriberFullyEstablished.Store(false)
+	_ = c.conn.Close()
 	c.publisher.Close()
 	c.subscriber.Close()
 	c.cancel()
+}
+
+func (c *RTCClient) RefreshToken() string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	return c.refreshToken
+}
+
+func (c *RTCClient) PongReceivedAt() int64 {
+	return c.pongReceivedAt.Load()
+}
+
+func (c *RTCClient) SendPing() error {
+	return c.SendRequest(&livekit.SignalRequest{
+		Message: &livekit.SignalRequest_Ping{
+			Ping: time.Now().UnixNano(),
+		},
+	})
 }
 
 func (c *RTCClient) SendRequest(msg *livekit.SignalRequest) error {
@@ -408,6 +464,14 @@ func (c *RTCClient) SendIceCandidate(ic *webrtc.ICECandidate, target livekit.Sig
 			Trickle: trickle,
 		},
 	})
+}
+
+func (c *RTCClient) hasPrimaryEverConnected() bool {
+	if c.subscriberAsPrimary.Load() {
+		return c.subscriber.HasEverConnected()
+	} else {
+		return c.publisher.HasEverConnected()
+	}
 }
 
 func (c *RTCClient) AddTrack(track *webrtc.TrackLocalStaticSample, path string) (writer *TrackWriter, err error) {
@@ -443,16 +507,19 @@ func (c *RTCClient) AddTrack(track *webrtc.TrackLocalStaticSample, path string) 
 
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.localTracks[ti.Sid] = track
 
-	if _, err = c.publisher.PeerConnection().AddTrack(track); err != nil {
+	sender, _, err := c.publisher.AddTrack(track, types.AddTrackParams{})
+	if err != nil {
+		logger.Errorw("add track failed", err, "trackID", ti.Sid, "participant", c.localParticipant.Identity, "pID", c.localParticipant.Sid)
 		return
 	}
-	c.publisher.Negotiate()
+	c.localTracks[ti.Sid] = track
+	c.trackSenders[ti.Sid] = sender
+	c.publisher.Negotiate(false)
 	writer = NewTrackWriter(c.ctx, track, path)
 
-	// write tracks only after ICE connectivity
-	if c.iceConnected.Get() {
+	// write tracks only after connection established
+	if c.hasPrimaryEverConnected() {
 		err = writer.Start()
 	} else {
 		c.pendingTrackWriters = append(c.pendingTrackWriters, writer)
@@ -462,7 +529,11 @@ func (c *RTCClient) AddTrack(track *webrtc.TrackLocalStaticSample, path string) 
 }
 
 func (c *RTCClient) AddStaticTrack(mime string, id string, label string) (writer *TrackWriter, err error) {
-	track, err := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: mime}, id, label)
+	return c.AddStaticTrackWithCodec(webrtc.RTPCodecCapability{MimeType: mime}, id, label)
+}
+
+func (c *RTCClient) AddStaticTrackWithCodec(codec webrtc.RTPCodecCapability, id string, label string) (writer *TrackWriter, err error) {
+	track, err := webrtc.NewTrackLocalStaticSample(codec, id, label)
 	if err != nil {
 		return
 	}
@@ -517,35 +588,27 @@ func (c *RTCClient) PublishData(data []byte, kind livekit.DataPacket_Kind) error
 			User: &livekit.UserPacket{Payload: data},
 		},
 	}
-	payload, err := proto.Marshal(dp)
-	if err != nil {
-		return err
-	}
 
-	if kind == livekit.DataPacket_RELIABLE {
-		return c.reliableDC.Send(payload)
-	} else {
-		return c.lossyDC.Send(payload)
+	return c.publisher.SendDataPacket(dp)
+}
+
+func (c *RTCClient) GetPublishedTrackIDs() []string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	var trackIDs []string
+	for key := range c.localTracks {
+		trackIDs = append(trackIDs, key)
 	}
+	return trackIDs
 }
 
 func (c *RTCClient) ensurePublisherConnected() error {
-	if c.publisherConnected.Get() {
+	if c.publisher.HasEverConnected() {
 		return nil
 	}
 
-	if c.publisher.PeerConnection().ConnectionState() == webrtc.PeerConnectionStateNew {
-		// start negotiating
-		c.publisher.Negotiate()
-	}
-
-	dcOpen := utils.AtomicFlag{}
-	c.reliableDC.OnOpen(func() {
-		dcOpen.TrySet(true)
-	})
-	if c.reliableDC.ReadyState() == webrtc.DataChannelStateOpen {
-		dcOpen.TrySet(true)
-	}
+	// start negotiating
+	c.publisher.Negotiate(false)
 
 	// wait until connected, increase wait time since it takes more than 10s sometimes on GH
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -555,16 +618,16 @@ func (c *RTCClient) ensurePublisherConnected() error {
 		case <-ctx.Done():
 			return fmt.Errorf("could not connect publisher after timeout")
 		case <-time.After(10 * time.Millisecond):
-			if c.publisherConnected.Get() && dcOpen.Get() {
+			if c.publisherFullyEstablished.Load() {
 				return nil
 			}
 		}
 	}
 }
 
-func (c *RTCClient) handleDataMessage(msg webrtc.DataChannelMessage) {
+func (c *RTCClient) handleDataMessage(kind livekit.DataPacket_Kind, data []byte) {
 	dp := &livekit.DataPacket{}
-	err := proto.Unmarshal(msg.Data, dp)
+	err := proto.Unmarshal(data, dp)
 	if err != nil {
 		return
 	}
@@ -576,54 +639,22 @@ func (c *RTCClient) handleDataMessage(msg webrtc.DataChannelMessage) {
 }
 
 // handles a server initiated offer, handle on subscriber PC
-func (c *RTCClient) handleOffer(desc webrtc.SessionDescription) error {
-	if err := c.subscriber.SetRemoteDescription(desc); err != nil {
-		return err
-	}
-
-	// if we received an offer, we'd have to answer
-	answer, err := c.subscriber.PeerConnection().CreateAnswer(nil)
-	if err != nil {
-		return err
-	}
-
-	if err := c.subscriber.PeerConnection().SetLocalDescription(answer); err != nil {
-		return err
-	}
-
-	// send remote an answer
-	logger.Infow("sending subscriber answer",
-		"participant", c.localParticipant.Identity,
-		//"sdp", answer,
-	)
-	return c.SendRequest(&livekit.SignalRequest{
-		Message: &livekit.SignalRequest_Answer{
-			Answer: rtc.ToProtoSessionDescription(answer),
-		},
-	})
+func (c *RTCClient) handleOffer(desc webrtc.SessionDescription) {
+	c.subscriber.HandleRemoteDescription(desc)
 }
 
 // the client handles answer on the publisher PC
-func (c *RTCClient) handleAnswer(desc webrtc.SessionDescription) error {
+func (c *RTCClient) handleAnswer(desc webrtc.SessionDescription) {
 	logger.Infow("handling server answer", "participant", c.localParticipant.Identity)
 	// remote answered the offer, establish connection
-	err := c.publisher.SetRemoteDescription(desc)
-	if err != nil {
-		return err
-	}
-
-	if !c.connected.TrySet(true) {
-		// already connected
-		return nil
-	}
-	return nil
+	c.publisher.HandleRemoteDescription(desc)
 }
 
-func (c *RTCClient) onOffer(offer webrtc.SessionDescription) {
+func (c *RTCClient) onOffer(offer webrtc.SessionDescription) error {
 	if c.localParticipant != nil {
 		logger.Infow("starting negotiation", "participant", c.localParticipant.Identity)
 	}
-	_ = c.SendRequest(&livekit.SignalRequest{
+	return c.SendRequest(&livekit.SignalRequest{
 		Message: &livekit.SignalRequest_Offer{
 			Offer: rtc.ToProtoSessionDescription(offer),
 		},
@@ -634,7 +665,7 @@ func (c *RTCClient) processTrack(track *webrtc.TrackRemote) {
 	lastUpdate := time.Time{}
 	pId, trackId := rtc.UnpackStreamID(track.StreamID())
 	if trackId == "" {
-		trackId = track.ID()
+		trackId = livekit.TrackID(track.ID())
 	}
 	c.lock.Lock()
 	c.subscribedTracks[pId] = append(c.subscribedTracks[pId], track)
@@ -642,7 +673,7 @@ func (c *RTCClient) processTrack(track *webrtc.TrackRemote) {
 
 	logger.Infow("client added track", "participant", c.localParticipant.Identity,
 		"pID", pId,
-		"track", trackId,
+		"trackID", trackId,
 	)
 
 	defer func() {
@@ -669,9 +700,9 @@ func (c *RTCClient) processTrack(track *webrtc.TrackRemote) {
 		c.bytesReceived[pId] += uint64(pkt.MarshalSize())
 		c.lock.Unlock()
 		numBytes += pkt.MarshalSize()
-		if time.Now().Sub(lastUpdate) > 30*time.Second {
+		if time.Since(lastUpdate) > 30*time.Second {
 			logger.Infow("consumed from participant",
-				"track", trackId, "pID", pId,
+				"trackID", trackId, "pID", pId,
 				"size", numBytes)
 			lastUpdate = time.Now()
 		}
@@ -703,5 +734,5 @@ func (c *RTCClient) SendNacks(count int) {
 	}
 	c.lock.Unlock()
 
-	c.subscriber.PeerConnection().WriteRTCP(packets)
+	_ = c.subscriber.WriteRTCP(packets)
 }

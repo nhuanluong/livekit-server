@@ -6,48 +6,56 @@ import (
 	"net"
 	"time"
 
-	"github.com/livekit/protocol/logger"
 	"github.com/pion/stun"
 	"github.com/pkg/errors"
 )
 
 func (conf *Config) determineIP() (string, error) {
 	if conf.RTC.UseExternalIP {
-		stunServers := conf.RTC.StunServers
+		stunServers := conf.RTC.STUNServers
 		if len(stunServers) == 0 {
 			stunServers = DefaultStunServers
 		}
-		ip, err := GetExternalIP(stunServers)
-		if err == nil {
-			return ip, nil
-		} else {
-			logger.Errorw("could not get external IP", err)
+		var err error
+		for i := 0; i < 3; i++ {
+			var ip string
+			ip, err = GetExternalIP(stunServers, nil)
+			if err == nil {
+				return ip, nil
+			} else {
+				time.Sleep(500 * time.Millisecond)
+			}
 		}
+		return "", errors.Errorf("could not resolve external IP: %v", err)
 	}
 
 	// use local ip instead
-	return GetLocalIPAddress()
+	addresses, err := GetLocalIPAddresses()
+	if len(addresses) > 0 {
+		return addresses[0], err
+	}
+	return "", err
 }
 
-func GetLocalIPAddress() (string, error) {
+func GetLocalIPAddresses() ([]string, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	// handle err
-	var loopBack string
-	for _, i := range ifaces {
-		addrs, err := i.Addrs()
+	loopBacks := make([]string, 0)
+	addresses := make([]string, 0)
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
 		for _, addr := range addrs {
 			var ip net.IP
-			switch v := addr.(type) {
+			switch typedAddr := addr.(type) {
 			case *net.IPNet:
-				ip = v.IP.To4()
+				ip = typedAddr.IP.To4()
 			case *net.IPAddr:
-				ip = v.IP.To4()
+				ip = typedAddr.IP.To4()
 			default:
 				continue
 			}
@@ -55,24 +63,35 @@ func GetLocalIPAddress() (string, error) {
 				continue
 			}
 			if ip.IsLoopback() {
-				loopBack = ip.String()
+				loopBacks = append(loopBacks, ip.String())
 			} else {
-				return ip.String(), nil
+				addresses = append(addresses, ip.String())
 			}
 		}
 	}
 
-	if loopBack != "" {
-		return loopBack, nil
+	if len(addresses) > 0 {
+		return addresses, nil
 	}
-	return "", fmt.Errorf("could not find local IP address")
+	if len(loopBacks) > 0 {
+		return loopBacks, nil
+	}
+	return nil, fmt.Errorf("could not find local IP address")
 }
 
-func GetExternalIP(stunServers []string) (string, error) {
+// GetExternalIP return external IP for localAddr from stun server. If localAddr is nil, a local address is chosen automatically.
+func GetExternalIP(stunServers []string, localAddr net.Addr) (string, error) {
 	if len(stunServers) == 0 {
 		return "", errors.New("STUN servers are required but not defined")
 	}
-	c, err := stun.Dial("udp4", stunServers[0])
+	dialer := &net.Dialer{
+		LocalAddr: localAddr,
+	}
+	conn, err := dialer.Dial("udp4", stunServers[0])
+	if err != nil {
+		return "", err
+	}
+	c, err := stun.NewClient(conn)
 	if err != nil {
 		return "", err
 	}
